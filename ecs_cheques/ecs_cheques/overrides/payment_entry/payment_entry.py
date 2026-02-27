@@ -117,19 +117,18 @@ def _get_cheque_paid_amount(doc, company_currency):
     exch_party_to_mop = flt(ctr.get("exchange_rate_party_to_mop") or 0)
 
     # Detect the "same-currency pair" scenario: both accounts share the same
-    # non-company currency (e.g. both ILS when company currency is USD).
-    # In that case exchange_rate_party_to_mop = 1.0 is meaningless for
-    # company-currency conversion and must not be used in the rate check.
+    # currency (whether company currency or foreign, e.g. USD=USD or ILS=ILS).
+    # In that case exchange_rate_party_to_mop is meaningless and must not be
+    # used in the bidirectional rate comparison.
     ctr_from_currency = ctr.get("account_currency_from") or ""
     ctr_to_currency = ctr.get("account_currency") or ""
-    same_non_company_currency = (
+    same_currency_pair = (
         ctr_from_currency
         and ctr_to_currency
         and ctr_from_currency == ctr_to_currency
-        and ctr_from_currency != company_currency
     )
 
-    if exch_party_to_mop > 0 and not same_non_company_currency:
+    if exch_party_to_mop > 0 and not same_currency_pair:
         # Bidirectional rate path: company-currency base is
         # PE.paid_amount × source_exchange_rate (= exchange_rate_party_to_mop).
         pe_source = flt(doc.source_exchange_rate) or 1.0
@@ -143,8 +142,8 @@ def _get_cheque_paid_amount(doc, company_currency):
             )
         return flt(flt(doc.paid_amount) * pe_source, 9)
 
-    if same_non_company_currency:
-        # Both accounts share the same non-company currency: trust the PE's
+    if same_currency_pair:
+        # Both accounts share the same currency: trust the PE's
         # source_exchange_rate (set by ERPNext validate) for company-currency conversion.
         pe_source = flt(doc.source_exchange_rate) or 1.0
         return flt(flt(doc.paid_amount) * pe_source, 9)

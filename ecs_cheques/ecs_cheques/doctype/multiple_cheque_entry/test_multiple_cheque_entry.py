@@ -572,3 +572,302 @@ class TestExchangeRatePartyToMop(unittest.TestCase):
 		pe = self._inserted
 		self.assertAlmostEqual(pe.get("paid_amount"), 3159.059, places=6,
 			msg="paid_amount must equal amount_in_company_currency")
+
+
+# ---------------------------------------------------------------------------
+# Bug A: USD → USD same-company-currency scenario
+# ---------------------------------------------------------------------------
+
+class TestUSDtoUSDSameCompanyCurrency(unittest.TestCase):
+	"""Receive: paid_from = USD (company), paid_to = USD (company).
+	Both accounts in company currency – no exchange-rate conversion needed.
+	exchange_rate_party_to_mop may contain a stale wrong value; it must be
+	cleared and must NOT cause a mismatch error.
+	"""
+
+	_STALE_RATE = 0.31655   # wrong value that would cause the mismatch error
+
+	def _make_row(self):
+		return _Row(
+			name="ROW-USD-USD",
+			idx=1,
+			account_paid_from="USD-Receivable",
+			account_paid_to="USD-Wallet",
+			paid_amount=1000.0,
+			amount_in_company_currency=1000.0,
+			target_exchange_rate=1.0,
+			exchange_rate_mop_to_party=3.159059,   # stale value from a previous ILS→USD rate lookup
+			exchange_rate_party_to_mop=self._STALE_RATE,   # stale 1/3.159059 value from JS sync
+			mode_of_payment="Cheque",
+			party_type="Customer",
+			party="CUST-USD",
+			cheque_type="Crossed",
+			reference_no="CHQ-USD",
+			reference_date="2024-01-15",
+			first_beneficiary="Company",
+			person_name="",
+			issuer_name="",
+			picture_of_check=None,
+			bank="National Bank",
+			payment_entry=None,
+		)
+
+	def setUp(self):
+		import sys
+		self._frappe = sys.modules["frappe"]
+		self._inserted = {}
+		self._submitted = False
+		self._set_values = []
+
+		row = self._make_row()
+		doc = _Doc(
+			name="MCE-USD",
+			company="Test Co USD",
+			payment_type="Receive",
+			posting_date="2024-01-15",
+			mode_of_payment="Cheque",
+			mode_of_payment_type="Cheque",
+			cheque_bank="National Bank",
+			bank_acc="Bank-USD",
+			cheque_table=[row],
+			cheque_table_2=[],
+		)
+
+		class _FakePE:
+			def __init__(inner_self, d):
+				inner_self.__dict__.update(d)
+				inner_self.name = "PE-USD-USD"
+				inner_self.flags = type("F", (), {"ignore_permissions": False})()
+
+			def insert(inner_self):
+				self._inserted = inner_self.__dict__.copy()
+
+			def submit(inner_self):
+				self._submitted = True
+
+		def _get_doc(arg, *rest):
+			if arg == "Multiple Cheque Entry":
+				return doc
+			return _FakePE(arg)
+
+		self._frappe.get_doc = _get_doc
+
+		class _DB:
+			def get_value(self, doctype, name, field):
+				if doctype == "Company":
+					return "USD"
+				if doctype == "Account":
+					return "USD"   # both accounts are USD
+				return None
+
+			def set_value(self_, doctype, name, field, value):
+				self._set_values.append((doctype, name, field, value))
+
+		self._frappe.db = _DB()
+		self._frappe.throw = lambda msg, exc=None: (_ for _ in ()).throw(Exception(msg))
+
+	def test_usd_usd_source_and_target_rates_are_1(self):
+		"""USD→USD: source and target exchange rates must both be 1."""
+		create_payment_entry_from_cheque("MCE-USD", "ROW-USD-USD")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("source_exchange_rate"), 1.0, places=6)
+		self.assertAlmostEqual(pe.get("target_exchange_rate"), 1.0, places=6)
+
+	def test_usd_usd_paid_and_received_amounts_equal(self):
+		"""USD→USD: paid_amount and received_amount must equal the cheque amount."""
+		create_payment_entry_from_cheque("MCE-USD", "ROW-USD-USD")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("paid_amount"), 1000.0, places=6)
+		self.assertAlmostEqual(pe.get("received_amount"), 1000.0, places=6)
+
+	def test_usd_usd_stale_party_to_mop_cleared(self):
+		"""USD→USD: stale exchange_rate_party_to_mop must be cleared to 0."""
+		create_payment_entry_from_cheque("MCE-USD", "ROW-USD-USD")
+		cleared = [sv for sv in self._set_values
+				   if sv[0] == "Cheque Table Receive"
+				   and sv[2] == "exchange_rate_party_to_mop"
+				   and sv[3] == 0]
+		self.assertTrue(cleared, "exchange_rate_party_to_mop must be set to 0 for USD→USD")
+
+	def test_usd_usd_stale_mop_to_party_cleared(self):
+		"""USD→USD: stale exchange_rate_mop_to_party must be cleared to 0."""
+		create_payment_entry_from_cheque("MCE-USD", "ROW-USD-USD")
+		cleared = [sv for sv in self._set_values
+				   if sv[0] == "Cheque Table Receive"
+				   and sv[2] == "exchange_rate_mop_to_party"
+				   and sv[3] == 0]
+		self.assertTrue(cleared, "exchange_rate_mop_to_party must be set to 0 for USD→USD")
+
+	def test_usd_usd_gl_balance(self):
+		"""USD→USD: GL invariant base_paid == base_received."""
+		create_payment_entry_from_cheque("MCE-USD", "ROW-USD-USD")
+		pe = self._inserted
+		base_paid = pe.get("paid_amount") * pe.get("source_exchange_rate")
+		base_received = pe.get("received_amount") * pe.get("target_exchange_rate")
+		self.assertAlmostEqual(base_paid, base_received, places=2)
+
+
+# ---------------------------------------------------------------------------
+# Bug B: JOD → USD (foreign paid_to, company paid_from) scenario
+# ---------------------------------------------------------------------------
+
+class TestJODtoUSDReceive(unittest.TestCase):
+	"""Receive: paid_from = USD (company), paid_to = JOD (foreign MOP account).
+	Cheque amount: 1000 JOD; amount_in_company_currency: 1410.437 USD.
+	target_exchange_rate must be 1410.437/1000 = 1.410437, NOT stored_rate.
+	"""
+
+	_JOD_RATE = 1.410437       # 1 JOD = 1.410437 USD
+	_CHEQUE_AMOUNT_JOD = 1000.0
+	_BASE_USD = 1410.437
+
+	def _make_row(self):
+		return _Row(
+			name="ROW-JOD-USD",
+			idx=1,
+			account_paid_from="USD-Receivable",
+			account_paid_to="JOD-Wallet",
+			paid_amount=self._CHEQUE_AMOUNT_JOD,
+			amount_in_company_currency=self._BASE_USD,
+			target_exchange_rate=self._JOD_RATE,
+			mode_of_payment="Cheque",
+			party_type="Customer",
+			party="CUST-JOD",
+			cheque_type="Crossed",
+			reference_no="CHQ-JOD",
+			reference_date="2024-01-15",
+			first_beneficiary="Company",
+			person_name="",
+			issuer_name="",
+			picture_of_check=None,
+			bank="Jordan Bank",
+			payment_entry=None,
+		)
+
+	def setUp(self):
+		import sys
+		self._frappe = sys.modules["frappe"]
+		self._inserted = {}
+		self._submitted = False
+		self._set_values = []
+
+		row = self._make_row()
+		doc = _Doc(
+			name="MCE-JOD",
+			company="Test Co USD",
+			payment_type="Receive",
+			posting_date="2024-01-15",
+			mode_of_payment="Cheque",
+			mode_of_payment_type="Cheque",
+			cheque_bank="Jordan Bank",
+			bank_acc="Bank-USD",
+			cheque_table=[row],
+			cheque_table_2=[],
+		)
+
+		class _FakePE:
+			def __init__(inner_self, d):
+				inner_self.__dict__.update(d)
+				inner_self.name = "PE-JOD-USD"
+				inner_self.flags = type("F", (), {"ignore_permissions": False})()
+
+			def insert(inner_self):
+				self._inserted = inner_self.__dict__.copy()
+
+			def submit(inner_self):
+				self._submitted = True
+
+		def _get_doc(arg, *rest):
+			if arg == "Multiple Cheque Entry":
+				return doc
+			return _FakePE(arg)
+
+		self._frappe.get_doc = _get_doc
+
+		class _DB:
+			def get_value(self, doctype, name, field):
+				if doctype == "Company":
+					return "USD"
+				if doctype == "Account":
+					if name == "USD-Receivable":
+						return "USD"
+					if name == "JOD-Wallet":
+						return "JOD"
+				return None
+
+			def set_value(self_, doctype, name, field, value):
+				self._set_values.append((doctype, name, field, value))
+
+		self._frappe.db = _DB()
+		self._frappe.throw = lambda msg, exc=None: (_ for _ in ()).throw(Exception(msg))
+
+	def test_jod_usd_source_rate_is_1(self):
+		"""JOD→USD Receive: source_exchange_rate must be 1 (paid_from = company currency)."""
+		create_payment_entry_from_cheque("MCE-JOD", "ROW-JOD-USD")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("source_exchange_rate"), 1.0, places=6)
+
+	def test_jod_usd_target_rate_derived_from_amounts(self):
+		"""JOD→USD Receive: target_exchange_rate = paid_amount / received_amount."""
+		create_payment_entry_from_cheque("MCE-JOD", "ROW-JOD-USD")
+		pe = self._inserted
+		expected = self._BASE_USD / self._CHEQUE_AMOUNT_JOD   # 1.410437
+		self.assertAlmostEqual(pe.get("target_exchange_rate"), expected, places=4)
+
+	def test_jod_usd_received_amount_is_cheque_amount(self):
+		"""JOD→USD Receive: received_amount must equal the JOD cheque amount."""
+		create_payment_entry_from_cheque("MCE-JOD", "ROW-JOD-USD")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("received_amount"), self._CHEQUE_AMOUNT_JOD, places=3)
+
+	def test_jod_usd_paid_amount_is_base_usd(self):
+		"""JOD→USD Receive: paid_amount must equal amount_in_company_currency (USD)."""
+		create_payment_entry_from_cheque("MCE-JOD", "ROW-JOD-USD")
+		pe = self._inserted
+		self.assertAlmostEqual(pe.get("paid_amount"), self._BASE_USD, places=3)
+
+	def test_jod_usd_gl_balance(self):
+		"""JOD→USD Receive: base_paid == base_received (no Exchange Gain/Loss)."""
+		create_payment_entry_from_cheque("MCE-JOD", "ROW-JOD-USD")
+		pe = self._inserted
+		base_paid = pe.get("paid_amount") * pe.get("source_exchange_rate")
+		base_received = pe.get("received_amount") * pe.get("target_exchange_rate")
+		self.assertAlmostEqual(base_paid, base_received, places=2,
+			msg=f"GL imbalance: base_paid={base_paid} != base_received={base_received}")
+
+	def test_jod_usd_compute_helper_gl_balance(self):
+		"""_compute_payment_entry_amounts: JOD→USD Receive gives consistent amounts."""
+		result = _compute_payment_entry_amounts(
+			row_paid_amount=1000.0,
+			paid_from_currency="USD",
+			paid_to_currency="JOD",
+			company_currency="USD",
+			stored_exchange_rate=self._JOD_RATE,
+			payment_type="Receive",
+		)
+		base_paid = result["paid_amount"] * result["source_exchange_rate"]
+		base_received = result["received_amount"] * result["target_exchange_rate"]
+		self.assertAlmostEqual(base_paid, base_received, places=2)
+
+
+# ---------------------------------------------------------------------------
+# _compute_payment_entry_amounts: USD→USD same-company-currency
+# ---------------------------------------------------------------------------
+
+class TestComputeAmountsUSDtoUSD(unittest.TestCase):
+	"""_compute_payment_entry_amounts for USD→USD (company = USD)."""
+
+	def test_usd_usd_company_currency_rates_are_1(self):
+		"""USD→USD company-currency: source and target rates must both be 1."""
+		result = _compute_payment_entry_amounts(
+			row_paid_amount=1000.0,
+			paid_from_currency="USD",
+			paid_to_currency="USD",
+			company_currency="USD",
+			stored_exchange_rate=0.31655,   # stale/wrong value
+			payment_type="Receive",
+		)
+		self.assertEqual(result["source_exchange_rate"], 1.0)
+		self.assertEqual(result["target_exchange_rate"], 1.0)
+		self.assertAlmostEqual(result["paid_amount"], 1000.0, places=3)
+		self.assertAlmostEqual(result["received_amount"], 1000.0, places=3)

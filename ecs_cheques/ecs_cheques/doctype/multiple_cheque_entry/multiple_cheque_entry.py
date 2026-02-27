@@ -186,11 +186,14 @@ def create_payment_entry_from_cheque(docname, row_id):
 			# will fetch the correct foreign-currency → company-currency rate.
 			source_exchange_rate = None
 			target_exchange_rate = None
-			# Clear any misleading exchange_rate_party_to_mop (e.g. 1.0 set by JS)
-			# so that _get_cheque_paid_amount won't use the bidirectional rate path.
-			if getattr(row, "exchange_rate_party_to_mop", None):
-				frappe.db.set_value("Cheque Table Receive", row.name,
-									"exchange_rate_party_to_mop", 0)
+		# Clear any misleading bidirectional rates for ALL same-currency pairs
+		# so that _get_cheque_paid_amount won't use the bidirectional rate path.
+		if flt(getattr(row, "exchange_rate_party_to_mop", 0)) != 0:
+			frappe.db.set_value("Cheque Table Receive", row.name,
+								"exchange_rate_party_to_mop", 0)
+		if flt(getattr(row, "exchange_rate_mop_to_party", 0)) != 0:
+			frappe.db.set_value("Cheque Table Receive", row.name,
+								"exchange_rate_mop_to_party", 0)
 	elif is_receive:
 		# paid_from = party account, paid_to = bank/MOP account.
 		paid_amount = flt(row.amount_in_company_currency)   # in paid_from currency
@@ -205,7 +208,13 @@ def create_payment_entry_from_cheque(docname, row_id):
 			)
 		elif paid_from_currency == company_currency:
 			source_exchange_rate = 1.0
-			target_exchange_rate = stored_rate          # paid_to_currency → company_currency
+			# target_exchange_rate = how many company-currency units per 1 paid_to unit.
+			# Derived from actual amounts to guarantee GL balance:
+			# paid_amount * source_rate = received_amount * target_rate
+			if received_amount:
+				target_exchange_rate = flt(paid_amount / received_amount, 9)
+			else:
+				target_exchange_rate = stored_rate
 		else:
 			# paid_to_currency == company_currency
 			source_exchange_rate = flt(1.0 / stored_rate, 9) if stored_rate else 1.0
