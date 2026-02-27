@@ -93,7 +93,8 @@ def _get_cheque_paid_amount(doc, company_currency):
     ctr = frappe.db.get_value(
         "Cheque Table Receive",
         doc.cheque_table_no,
-        ["paid_amount", "target_exchange_rate", "exchange_rate_party_to_mop"],
+        ["paid_amount", "target_exchange_rate", "exchange_rate_party_to_mop",
+         "account_currency_from", "account_currency"],
         as_dict=True,
     )
     if not ctr:
@@ -115,7 +116,18 @@ def _get_cheque_paid_amount(doc, company_currency):
 
     exch_party_to_mop = flt(ctr.get("exchange_rate_party_to_mop") or 0)
 
-    if exch_party_to_mop > 0:
+    # When both accounts share the same currency, exchange_rate_party_to_mop=1.0
+    # is a mathematical artefact of target_exchange_rate=1 (1/1=1), not a real
+    # bidirectional rate.  In this case skip the bidirectional path and derive
+    # the base amount directly from the PE's source_exchange_rate, which was
+    # correctly set by ERPNext's validate() (e.g. ILS→USD = 0.31655).
+    ctr_currency_from = ctr.get("account_currency_from") or ""
+    ctr_currency_to = ctr.get("account_currency") or ""
+    same_currency_accounts = bool(
+        ctr_currency_from and ctr_currency_to and ctr_currency_from == ctr_currency_to
+    )
+
+    if exch_party_to_mop > 0 and not same_currency_accounts:
         # Bidirectional rate path: company-currency base is
         # PE.paid_amount × source_exchange_rate (= exchange_rate_party_to_mop).
         pe_source = flt(doc.source_exchange_rate) or 1.0
@@ -128,6 +140,14 @@ def _get_cheque_paid_amount(doc, company_currency):
                 ).format(pe_source, exch_party_to_mop, doc.cheque_table_no)
             )
         return flt(flt(doc.paid_amount) * pe_source, 9)
+
+    if same_currency_accounts:
+        # Same-currency pair (e.g. both ILS, company USD): the company-currency
+        # base is paid_amount × source_exchange_rate (the foreign→company rate).
+        # Both the bidirectional path above and this path share the same formula;
+        # `exch_party_to_mop` is intentionally not used here since its 1.0 value
+        # is a same-currency artefact, not a real rate.
+        return flt(flt(doc.paid_amount) * (flt(doc.source_exchange_rate) or 1.0), 9)
 
     # Legacy path: company-currency base from ctr.paid_amount × target_exchange_rate.
     ctr_rate = flt(ctr.target_exchange_rate) or 1.0
