@@ -106,14 +106,26 @@ def _make_doc(**kwargs):
     return doc
 
 
-def _mock_cheque_table(paid_amount, target_exchange_rate):
+def _mock_cheque_table(paid_amount, target_exchange_rate, exchange_rate_party_to_mop=0,
+                       account_currency_from=None, account_currency=None):
     """Return a namespace that mimics frappe.db.get_value(..., as_dict=True).
 
     frappe.db.get_value with as_dict=True returns a frappe._dict which supports
-    both dict-style and attribute-style access.  types.SimpleNamespace gives us
-    attribute-style access (ctr.paid_amount) without requiring a real Frappe env.
+    both dict-style and attribute-style access.  We provide a lightweight class
+    that supports both so the tests don't require a real Frappe environment.
     """
-    return types.SimpleNamespace(paid_amount=paid_amount, target_exchange_rate=target_exchange_rate)
+    class _CTR:
+        def __init__(self):
+            self.paid_amount = paid_amount
+            self.target_exchange_rate = target_exchange_rate
+            self.exchange_rate_party_to_mop = exchange_rate_party_to_mop
+            self.account_currency_from = account_currency_from
+            self.account_currency = account_currency
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    return _CTR()
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +247,58 @@ class TestGetChequePaidAmount(unittest.TestCase):
         with patch.object(frappe.db, "get_value", return_value=ctr):
             result = _get_cheque_paid_amount(doc, "ILS")
         self.assertAlmostEqual(result, 5000.0, places=3)
+
+    def test_same_currency_non_company_no_mismatch_error(self):
+        """
+        Bug 1 regression: both accounts ILS, company USD.
+
+        When exchange_rate_party_to_mop=1.0 (stored because both accounts share
+        the same currency, so target_exchange_rate=1 and 1/1=1), the function must
+        NOT raise a mismatch error even though source_exchange_rate=0.31655
+        (the correct ILS→USD rate).  Instead it must return
+        paid_amount × source_exchange_rate = 5000 × 0.31655 = 1582.75.
+        """
+        ILS_TO_USD = round(1.0 / 3.159059, 6)  # ≈ 0.316556
+        ctr = _mock_cheque_table(
+            paid_amount=5000.0,
+            target_exchange_rate=1.0,
+            exchange_rate_party_to_mop=1.0,   # same-currency artefact
+            account_currency_from="ILS",
+            account_currency="ILS",
+        )
+        doc = _make_doc(
+            cheque_table_no="CHQ-SAME-NONCO",
+            paid_amount=5000.0,
+            source_exchange_rate=ILS_TO_USD,   # correct ILS→USD rate on PE
+        )
+        with patch.object(frappe.db, "get_value", return_value=ctr):
+            result = _get_cheque_paid_amount(doc, "USD")
+        expected = 5000.0 * ILS_TO_USD
+        self.assertAlmostEqual(result, expected, places=6,
+            msg="Same-currency non-company: base must be paid_amount × source_exchange_rate")
+
+    def test_bidirectional_path_still_validates_real_mismatch(self):
+        """
+        When exchange_rate_party_to_mop is a real bidirectional rate (currencies differ),
+        a significant mismatch between source_exchange_rate and exchange_rate_party_to_mop
+        must still raise an error.
+        """
+        RATE = round(1.0 / 3.159059, 9)  # ILS→USD rate stored on CTR
+        ctr = _mock_cheque_table(
+            paid_amount=3159.059,
+            target_exchange_rate=3.159059,
+            exchange_rate_party_to_mop=RATE,
+            account_currency_from="ILS",
+            account_currency="USD",  # currencies DIFFER → real bidirectional rate
+        )
+        doc = _make_doc(
+            cheque_table_no="CHQ-BIDI-MISMATCH",
+            paid_amount=3159.059,
+            source_exchange_rate=0.5,  # wrong rate → mismatch
+        )
+        with patch.object(frappe.db, "get_value", return_value=ctr):
+            with self.assertRaises(Exception):
+                _get_cheque_paid_amount(doc, "USD")
 
 
 # ---------------------------------------------------------------------------
